@@ -23,14 +23,21 @@ from the child weight calculation **unconditionally**, unlike every inheritable 
 around it. As soon as the price calculation has a *Viktberäkning* selected, the flag that
 is set higher up in the hierarchy is silently switched off — but only for pricing.
 
+Confirmed in the customer database: office, price list and customer all have the flag **on**
+(WCA 1 and WCA 27), while price calculations **10542 / 10543 "Pris/100kg…"** point at
+**WCA 11 "Övriga Europa"**, which has it **off**. See
+[Confirmed against the customer database](#confirmed-against-the-customer-database).
+
 **Note for support:** the 112 the customer calls "correct" is *also* wrong. It is
 11 × 1 010 kg = 11 110 kg. With the order screen's own arithmetic the answer should be
-`ceil(2410 / 100)` = **25 units**. Both figures in the ticket come from the same defect.
+`ceil(2410 / 100)` = **25 units**. Both figures in the ticket come from the same defect, so
+fixing this will move prices on that price list a long way down — agree it with Sandahls
+first.
 
 ## Reconstruction of the three observed states
 
 Inputs: kolli row `Antal = 11`, `Vikt = 1 010,00`, `Flakmeter = 1,30`.
-Derived constants: `WCA_LoadMeterFactor = 1850` (2405 / 1,30), unit = per 100 kg with
+Constants: `WCA_LoadMeterFactor = 1850` (confirmed on WCA 27), unit = per 100 kg with
 rounding **Up** (`PRR_PriceRoundingType.Up` → `Math.Ceiling`; 111,1 → 112 is only
 reachable with ceiling, not with `Math.Round`).
 
@@ -134,10 +141,53 @@ No relevant changes to `Order/CalculateWeights/`, `Order/Price/` or
 and `origin/master` still has the identical unconditional assignment. Upgrading will not
 help.
 
-## Verify against the customer database
+## Confirmed against the customer database
 
-Confirms which WCA is attached where and what the two flags say. (Order number 1311093 is
-assumed to be `DEL_Id`; adjust if their numbering differs.)
+Run 2026-09-01 against `SB-SQL01\OPTER`, database `opter`. Everything matches the
+reconstruction above.
+
+**Weight-calculation hierarchy** — every level the order screen uses has the flag **on**:
+
+| Level | WCA_Id | Name | IgnoreQuantity | PricingWeightPerPackage | LoadMeterFactor | RRS_Id |
+|---|---|---|---|---|---|---|
+| Office | 1 | Standard | **1** | 0 | 1950 | 1 |
+| PriceList | 27 | Övriga Europa – Logent Utrikes | **1** | 0 | 1850 | NULL |
+| Customer | 27 | Övriga Europa – Logent Utrikes | **1** | 0 | 1850 | NULL |
+
+No ServiceType row — `PST_WCA_Id` is 0.
+
+**Price calculations on the price list** — the extra level only pricing sees:
+
+| PCC_Id | Name | PCC_WCA_Id | WCA | IgnoreQuantity | PricingWeightPerPackage |
+|---|---|---|---|---|---|
+| 10528 | Fraktrunt… | NULL | – | – | – |
+| 10535 | Nod… | NULL | – | – | – |
+| **10542** | **Pris/100kg avg Näs** | **11** | Övriga Europa | **0** | 0 |
+| **10543** | **Pris/100kg …** | **11** | Övriga Europa | **0** | 0 |
+| 10569 | Tidslossning – Logent | NULL | – | – | – |
+
+The two `Pris/100kg` calculations point at **WCA 11 "Övriga Europa"**, which has the flag
+off. That is the reset. (Names read off a low-resolution screenshot — the ids are reliable,
+the exact spelling of the names is not.)
+
+**Order 1311093:** `DEL_Weight` NULL, `DEL_CalculatedWeight` 1010, `DEL_LoadMeter` NULL,
+`DEL_CalculatedLoadMeter` 1,30, `DEL_LoadMeterWeight` 2405, `DEL_PricingWeight` 2410.
+
+**Package row:** `PAC_Quantity` 11, `PAC_Weight` 1010, `PAC_LoadMeter` 1,30, with
+`PAC_LoadMeterManualChange` / `PAC_WeightManualChange` / `PAC_QuantityManualChange` all 1 —
+so the entered values are used as-is.
+
+Two things this settles beyond the main finding:
+
+* `WCA_LoadMeterFactor` **1850** at price-list level correctly overrides the office's
+  **1950** — the nullable settings inherit properly. Only the two non-nullable `bool` flags
+  leak through. 1,30 × 1850 = 2405, then `WCA_RRS_Id` 1 rounds it to the 2410 on screen.
+* WCA 11's own loadmeter factor must be NULL or 1850 — with the office's 1950 the units
+  would have come out at 279, not 265.
+
+### Queries used
+
+(Order number 1311093 is `DEL_Id`.)
 
 ```sql
 -- Which weight calculations apply to this order, and how each one sets the two flags
@@ -188,26 +238,37 @@ SELECT  p.PAC_Quantity, p.PAC_Weight, p.PAC_LoadMeter,
 FROM    PAC_Package p WHERE p.PAC_DEL_Id = 1311093;
 ```
 
-Expected if the analysis holds: one of the first four levels has
-`WCA_IgnoreQuantityCalculatingPackages = 1`, and the `PCC_WCA_Id` weight calculation has it
-`= 0`.
-
 ## Workaround (no code change)
 
-Either of these makes pricing agree with the order screen, and both are settings-only:
+All three options are settings-only and all three land on the same answer for this order:
+pricing weight 2 410 → `ceil(24,10)` = **25 units**, not 112 and not 265.
 
-1. **Tick "Bortse från antal vid beräkning av kollin"** on the weight calculation that the
-   price calculation points to (Prislista → Prisberäkning → *Viktberäkning*). This is the
-   safe one — it only affects price calculations using that WCA.
-2. **Clear the *Viktberäkning* on the price calculation** if it exists only to set a factor
-   that is already inherited. With `PCC_WCA_Id = 0` the engine falls back to
-   `DEL_PricingWeight`, i.e. exactly the 2 410 shown on screen.
+1. **Repoint price calculations 10542 and 10543 to WCA 27** ("Övriga Europa – Logent
+   Utrikes", the one the price list already uses) instead of WCA 11. *Recommended* — the
+   most targeted change, and since it equals the price-list-level WCA the override becomes a
+   no-op.
+2. **Clear the *Viktberäkning*** on 10542/10543 (Prislista → Prisberäkning → *Viktberäkning*).
+   With `PCC_WCA_Id = 0` the engine skips the recalculation entirely and uses
+   `DEL_PricingWeight` — exactly the 2 410 shown on screen. Only do this if WCA 11 was not
+   there to set something the price list doesn't already provide.
+3. **Tick "Bortse från antal vid beräkning av kollin" on WCA 11** itself. Simplest, but the
+   widest blast radius — check what else uses WCA 11 first:
 
-Do **not** recommend clearing the flakmeter on the kolli row — that leaves the weight leg
-inflated 11× (the 112) and hides the problem behind a plausible-looking number.
+   ```sql
+   SELECT 'PCC' AS lvl, PCC_Id AS Id, PCC_Name AS Name FROM PCC_PriceCollectionCalculation WHERE PCC_WCA_Id = 11
+   UNION ALL SELECT 'PriceList',   PLI_Id, PLI_Name FROM PLI_PriceList        WHERE PLI_WCA_Id = 11
+   UNION ALL SELECT 'ServiceType', PST_Id, PST_Name FROM PST_PriceServiceType WHERE PST_WCA_Id = 11
+   UNION ALL SELECT 'Customer',    CUS_Id, CUS_Name FROM CUS_Customer         WHERE CUS_WCA_Id = 11
+   UNION ALL SELECT 'Office',      OFF_Id, OFF_Name FROM OFF_Office           WHERE OFF_WCA_Id = 11;
+   ```
 
-Existing orders priced through this price calculation are affected the same way; a price
-recalculation will be needed after the setting change.
+Do **not** clear the flakmeter on the kolli row — that leaves the weight leg inflated 11×
+(the 112) and hides the problem behind a plausible-looking number.
+
+Every order priced through 10542/10543 is affected the same way, so this is not a one-order
+correction: expect a price recalculation across that price list, and prices will drop
+sharply (this order goes 12 964 → whatever the 25-unit tier gives). Agree the change with
+Sandahls before applying it.
 
 ## Proposed code fix
 
@@ -255,5 +316,10 @@ of invisible.
   rounding rule set. Most likely the first screenshot shows a stored value and the second a
   freshly recalculated one, but this is unverified and worth a look if the customer reports
   drifting dimension weights. It does not affect the price defect.
-* Whether Sandahls has other price calculations with a *Viktberäkning* set — the same trap
-  applies to all of them.
+* **Why is WCA 11 on those two price calculations at all?** Its loadmeter factor is NULL or
+  1850, i.e. the same as what the price list already supplies, so it may be a leftover that
+  can simply be cleared. Worth asking whoever set up the Logent price list.
+* **How far does WCA 11 reach?** Other price calculations, price lists, service types or
+  customers pointing at it hit the same trap — the query under workaround option 3 lists
+  them. The same goes for any other WCA used at price-calculation level with the flag off
+  while a parent has it on.
